@@ -1,0 +1,136 @@
+name: multiarch-image
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Log in to Amazon ECR Public
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
+
+      - name: Build and push
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA-$ARCH"
+          docker build --provenance=false --sbom=false -t "$IMAGE" .
+
+          BUILT=$(docker image inspect --format '{{.Architecture}}' "$IMAGE")
+          if [ "$BUILT" != "$ARCH" ]; then
+            echo "::error::expected $ARCH, built $BUILT"
+            exit 1
+          fi
+
+          docker push "$IMAGE"
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create and push the manifest list
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          REPO="$REGISTRY/$ECR_REPOSITORY"
+          docker manifest create "$REPO:$GITHUB_SHA" \
+            "$REPO:$GITHUB_SHA-amd64" \
+            "$REPO:$GITHUB_SHA-arm64"
+          docker manifest push --purge "$REPO:$GITHUB_SHA"
+
+      - name: Check that both platforms are present
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          FOUND=$(docker manifest inspect "$REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA" \
+            | jq -r '[.manifests[].platform | "\(.os)/\(.architecture)"] | sort | join(",")')
+          echo "Platforms: $FOUND"
+          if [ "$FOUND" != "linux/amd64,linux/arm64" ]; then
+            echo "::error::manifest list has $FOUND, expected linux/amd64,linux/arm64"
+            exit 1
+          fi
+
+  verify:
+    name: verify (${{ matrix.arch }})
+    needs: manifest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Run the shared tag and check the reported architecture
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          EXPECTED: ${{ matrix.arch }}
+        run: |
+          docker run -d --name app -p 8080:8080 "$REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
+          for _ in $(seq 1 15); do
+            curl -fs http://localhost:8080/health >/dev/null && break
+            sleep 1
+          done
+          OUT=$(curl -fs http://localhost:8080/arch)
+          docker rm -f app >/dev/null
+          echo "Server reports: $OUT"
+          if [ "$OUT" != "$EXPECTED" ]; then
+            echo "::error::expected $EXPECTED, got $OUT"
+            exit 1
+          fi
