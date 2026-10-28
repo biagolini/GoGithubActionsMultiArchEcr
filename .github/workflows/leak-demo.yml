@@ -1,0 +1,8 @@
+name: leak-demo
+on: push
+permissions: {}
+jobs:
+  leak:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "${{ secrets.DEMO_SECRET }}" | base64
